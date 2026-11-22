@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
+import unicodedata
 import plotly.graph_objects as go
 from scipy.stats import norm, poisson
 from datetime import datetime
@@ -31,6 +32,66 @@ SEASON_OPTIONS = {
 
 DISCRETE_METRICS = {"3PM", "STL", "BLK", "STOCKS", "TOV"}
 
+ODDS_MARKET_MAP = {
+    "player_points": ("PTS", "Puntos (PTS)"),
+    "player_rebounds": ("REB", "Rebotes (REB)"),
+    "player_assists": ("AST", "Asistencias (AST)"),
+    "player_threes": ("3PM", "Triples (3PM)"),
+    "player_points_rebounds_assists": ("PRA", "Pts+Reb+Ast (PRA)"),
+    "player_points_rebounds": ("PR", "Pts+Reb (PR)"),
+    "player_points_assists": ("PA", "Pts+Ast (PA)"),
+    "player_rebounds_assists": ("RA", "Reb+Ast (RA)"),
+    "player_blocks_steals": ("STOCKS", "Robos+Tapones (STOCKS)"),
+}
+
+
+# ---------------------------------------------------------
+# UTILIDADES DE NORMALIZACIÓN Y CÁLCULO DE VALOR (EV+)
+# ---------------------------------------------------------
+def _normalize_text(text: str) -> str:
+    """Elimina tildes, puntos y sufijos (Jr., III) para empatar nombres entre APIs."""
+    if not text:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", str(text))
+    ascii_str = "".join(c for c in nfkd if not unicodedata.combining(c)).lower()
+    for ch in [".", ",", "'", "-"]:
+        ascii_str = ascii_str.replace(ch, " ")
+    tokens = [t for t in ascii_str.split() if t not in {"jr", "sr", "ii", "iii", "iv"}]
+    return " ".join(tokens)
+
+
+def evaluate_bet_value(model_prob_pct: float, decimal_odds: float) -> dict:
+    """
+    Calcula Probabilidad Implícita, Edge, Valor Esperado (EV%) y Stake Quarter-Kelly.
+    """
+    if decimal_odds <= 1.0 or model_prob_pct <= 0.0:
+        return {
+            "implied_prob": 0.0,
+            "edge_pct": 0.0,
+            "ev_pct": -100.0,
+            "kelly_quarter_pct": 0.0,
+            "is_value": False,
+        }
+
+    p = model_prob_pct / 100.0
+    q = 1.0 - p
+    b = decimal_odds - 1.0
+
+    implied_prob = (1.0 / decimal_odds) * 100.0
+    edge_pct = model_prob_pct - implied_prob
+    ev_pct = ((p * decimal_odds) - 1.0) * 100.0
+
+    kelly_full = max(0.0, ((b * p) - q) / b)
+    kelly_quarter_pct = round(kelly_full * 0.25 * 100.0, 2)
+
+    return {
+        "implied_prob": round(implied_prob, 1),
+        "edge_pct": round(edge_pct, 1),
+        "ev_pct": round(ev_pct, 1),
+        "kelly_quarter_pct": kelly_quarter_pct,
+        "is_value": ev_pct > 0.0,
+    }
+
 
 # ---------------------------------------------------------
 # FUNCIONES DE EXTRACCIÓN DE DATOS (ESPN PUBLIC API)
@@ -51,6 +112,7 @@ def fetch_nba_teams() -> list[dict]:
             {
                 "id": str(team.get("id")),
                 "name": team.get("displayName", "N/A"),
+                "nickname": team.get("name", ""),
                 "abbr": team.get("abbreviation", ""),
                 "logo": logos[0].get("href", "") if logos else "",
             }
@@ -233,6 +295,129 @@ def fetch_player_gamelog(athlete_id: str, season: int) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------
+# EXTRACCIÓN DE CUOTAS DE PLAYER PROPS (THE ODDS API v4)
+# ---------------------------------------------------------
+@st.cache_data(ttl=1800)
+def fetch_odds_api_events(api_key: str) -> tuple[list[dict], str | None]:
+    """Lista los partidos próximos en The Odds API para localizar el event_id."""
+    url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
+    try:
+        resp = requests.get(url, params={"apiKey": api_key}, timeout=15)
+        if resp.status_code == 401:
+            return [], "API Key inválida o sin autorización en The Odds API."
+        if resp.status_code == 429:
+            return [], "Límite de peticiones alcanzado en The Odds API."
+        resp.raise_for_status()
+        remaining = resp.headers.get("x-requests-remaining", "?")
+        return resp.json(), f"OK (Peticiones restantes: {remaining})"
+    except requests.RequestException as exc:
+        return [], f"Error de conexión con The Odds API: {exc}"
+
+
+@st.cache_data(ttl=1800)
+def fetch_event_player_props(api_key: str, event_id: str, regions: str = "us,eu") -> tuple[dict, str]:
+    """Descarga cuotas de Player Props de un partido específico."""
+    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
+    markets_str = ",".join(ODDS_MARKET_MAP.keys())
+    params = {
+        "apiKey": api_key,
+        "regions": regions,
+        "markets": markets_str,
+        "oddsFormat": "decimal",
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=20)
+        if resp.status_code != 200:
+            return {}, f"Error HTTP {resp.status_code}: {resp.text[:160]}"
+        remaining = resp.headers.get("x-requests-remaining", "?")
+        return resp.json(), f"Peticiones restantes en el mes: {remaining}"
+    except requests.RequestException as exc:
+        return {}, f"Error de red: {exc}"
+
+
+def parse_and_scan_player_odds(
+    event_odds_json: dict,
+    player_name: str,
+    df_player: pd.DataFrame,
+    weight_recent: float = 0.40,
+) -> pd.DataFrame:
+    """
+    Cruza todas las cuotas extraídas de las casas de apuestas para el jugador
+    contra las probabilidades del modelo estadístico y detecta errores (EV+).
+    """
+    target_norm = _normalize_text(player_name)
+    bookmakers = event_odds_json.get("bookmakers", [])
+    rows = []
+
+    for book in bookmakers:
+        book_title = book.get("title", book.get("key", "Casa"))
+        for mkt in book.get("markets", []):
+            mkt_key = mkt.get("key", "")
+            if mkt_key not in ODDS_MARKET_MAP:
+                continue
+            metric_col, metric_label = ODDS_MARKET_MAP[mkt_key]
+            if metric_col not in df_player.columns:
+                continue
+
+            for outcome in mkt.get("outcomes", []):
+                desc_norm = _normalize_text(outcome.get("description", ""))
+                if not desc_norm or (target_norm != desc_norm and target_norm not in desc_norm):
+                    continue
+
+                side = outcome.get("name", "")  # "Over" o "Under"
+                line = outcome.get("point")
+                price = outcome.get("price")
+
+                if line is None or price is None or side not in {"Over", "Under"}:
+                    continue
+
+                line_val = float(line)
+                odds_val = float(price)
+
+                sim = calculate_prop_probabilities(
+                    df_player, metric_col, line_val, weight_recent=weight_recent
+                )
+                model_prob = sim["prob_over"] if side == "Over" else sim["prob_under"]
+                fair_odds = sim["fair_odds_over"] if side == "Over" else sim["fair_odds_under"]
+                hr_all = sim["hit_rate_all"] if side == "Over" else round(100.0 - sim["hit_rate_all"], 1)
+                hr_l10 = sim["hit_rate_l10"] if side == "Over" else round(100.0 - sim["hit_rate_l10"], 1)
+
+                val_metrics = evaluate_bet_value(model_prob, odds_val)
+
+                if val_metrics["ev_pct"] >= 8.0 and val_metrics["edge_pct"] >= 4.0:
+                    signal = "🔥 ERROR CLARO (EV+ Alto)"
+                elif val_metrics["ev_pct"] > 0.0:
+                    signal = "✅ VALOR POSITIVO (EV+)"
+                else:
+                    signal = "⚪ Sin Valor (EV-)"
+
+                rows.append(
+                    {
+                        "Señal": signal,
+                        "Casa": book_title,
+                        "Mercado": metric_label,
+                        "Selección": f"{side} {line_val}",
+                        "Cuota Casa": round(odds_val, 2),
+                        "Cuota Justa": fair_odds,
+                        "Prob. Modelo (%)": model_prob,
+                        "Prob. Casa (%)": val_metrics["implied_prob"],
+                        "Edge (%)": val_metrics["edge_pct"],
+                        "EV (%)": val_metrics["ev_pct"],
+                        "Hit Rate Temp (%)": hr_all,
+                        "Hit Rate L10 (%)": hr_l10,
+                        "Stake Kelly 1/4 (%)": val_metrics["kelly_quarter_pct"],
+                    }
+                )
+
+    if not rows:
+        return pd.DataFrame()
+
+    df_res = pd.DataFrame(rows)
+    df_res = df_res.sort_values(by=["EV (%)", "Edge (%)"], ascending=False).reset_index(drop=True)
+    return df_res
+
+
+# ---------------------------------------------------------
 # CÁLCULOS ESTADÍSTICOS, PROYECCIONES Y LOGROS
 # ---------------------------------------------------------
 def _get_effective_std(series: pd.Series, mean_val: float) -> float:
@@ -361,7 +546,6 @@ def calculate_milestones_analysis(df: pd.DataFrame, weight_recent: float = 0.40)
     1+/2+/3+/4+ 3PM, Doble-Doble, Triple-Doble y combinadas).
     """
     milestone_specs = [
-        # (Grupo, Etiqueta del Logro, Columna, Umbral entero >= X)
         ("Puntos", "10+ Puntos", "PTS", 10),
         ("Puntos", "15+ Puntos", "PTS", 15),
         ("Puntos", "20+ Puntos", "PTS", 20),
@@ -393,12 +577,10 @@ def calculate_milestones_analysis(df: pd.DataFrame, weight_recent: float = 0.40)
 
     rows = []
     for group, label, col, target in milestone_specs:
-        # El umbral continuo equivalente a >= target es (target - 0.5)
         line_equiv = target - 0.5
         res = calculate_prop_probabilities(df, col, line_equiv, weight_recent=weight_recent)
         prob = res["prob_over"]
 
-        # Omitir logros totalmente fuera del perfil del jugador
         if prob < 4.0 and res["hit_rate_all"] == 0.0:
             continue
 
@@ -424,12 +606,10 @@ def calculate_milestones_analysis(df: pd.DataFrame, weight_recent: float = 0.40)
             }
         )
 
-    # Cálculo específico de Doble-Doble y Triple-Doble (combinando tasa empírica + probabilidad conjunta)
     prob_10_pts = calculate_prop_probabilities(df, "PTS", 9.5, weight_recent)["prob_over"] / 100.0
     prob_10_reb = calculate_prop_probabilities(df, "REB", 9.5, weight_recent)["prob_over"] / 100.0
     prob_10_ast = calculate_prop_probabilities(df, "AST", 9.5, weight_recent)["prob_over"] / 100.0
 
-    # Probabilidad teórica de al menos 2 de (PTS, REB, AST) >= 10
     p_dd_theo = (
         prob_10_pts * prob_10_reb * (1 - prob_10_ast)
         + prob_10_pts * prob_10_ast * (1 - prob_10_reb)
@@ -481,8 +661,8 @@ def calculate_milestones_analysis(df: pd.DataFrame, weight_recent: float = 0.40)
 # ---------------------------------------------------------
 # INTERFAZ DE USUARIO (SIDEBAR Y PANEL PRINCIPAL)
 # ---------------------------------------------------------
-st.title("🏀 NBA Player Analytics & Quantitative Props")
-st.caption("Proyecciones estadísticas, análisis de logros (PTS, REB, AST, 3PM, DD/TD) y modelado de líneas.")
+st.title("🏀 NBA Player Analytics & EV+ Odds Scanner")
+st.caption("Proyecciones estadísticas, análisis de logros (PTS, REB, AST, 3PM, DD/TD) y detección de errores de cuotas.")
 
 with st.sidebar:
     st.header("⚙️ Selección de Jugador")
@@ -492,7 +672,7 @@ with st.sidebar:
 
     search_mode = st.radio(
         "Modo de búsqueda",
-        ["Todos los Equipos (30)", "Partidos de Hoy (Cartelera)"],
+        ["Partidos de Hoy (Cartelera)", "Todos los Equipos (30)"],
         index=0,
     )
 
@@ -555,8 +735,18 @@ with st.sidebar:
         )
         / 100.0
     )
-
     location_filter = st.selectbox("Filtro de Localía", ["Todos", "Local", "Visitante"])
+
+    st.divider()
+    st.subheader("🔑 API de Cuotas (The Odds API)")
+    secret_odds_key = st.secrets.get("ODDS_API_KEY", "") if hasattr(st, "secrets") else ""
+    manual_odds_key = st.text_input(
+        "ODDS_API_KEY (opcional si está en Secrets)",
+        value=secret_odds_key,
+        type="password",
+        help="Obtén una clave gratuita en the-odds-api.com (500 peticiones/mes).",
+    )
+    active_odds_key = manual_odds_key.strip()
 
 
 # ---------------------------------------------------------
@@ -646,14 +836,13 @@ eff_cols[4].metric("Triple-Doble %", f"{df_filtered['TD'].mean() * 100:.1f}%")
 st.divider()
 
 # ---------------------------------------------------------
-# NUEVA SECCIÓN: ¿QUÉ SE ESPERA DEL JUGADOR? (PROYECCIONES Y LOGROS)
+# ANÁLISIS PREDICTIVO: ¿QUÉ SE ESPERA DEL JUGADOR?
 # ---------------------------------------------------------
 st.markdown("### 🔮 Análisis Predictivo: ¿Qué se espera del jugador?")
 
 df_expectations = generate_player_expectations(df_filtered, weight_recent=recent_weight)
 df_milestones = calculate_milestones_analysis(df_filtered, weight_recent=recent_weight)
 
-# Veredicto automático con las principales expectativas y logros más sólidos
 exp_map = dict(zip(df_expectations["Categoría"], df_expectations["Proyección Esperada"]))
 floor_map = dict(zip(df_expectations["Categoría"], df_expectations["Piso Seguro (75%)"]))
 
@@ -678,13 +867,6 @@ if not top_picks.empty:
         ]
     )
     summary_lines.append(f"**Logros con mayor respaldo estadístico:** {picks_str}")
-else:
-    best_row = df_milestones.iloc[0] if not df_milestones.empty else None
-    if best_row is not None:
-        summary_lines.append(
-            f"**Logro más probable:** **{best_row['Logro / Hito']}** "
-            f"(Prob: {best_row['Probabilidad (%)']}% | L10: {best_row['Hit Rate L10 (%)']}%)"
-        )
 
 st.success("\n\n".join(summary_lines))
 
@@ -697,11 +879,7 @@ with tab_proj:
         "El **Piso Seguro (75%)** indica el valor mínimo que el jugador supera en aproximadamente 3 de cada 4 partidos "
         "según su distribución estadística y forma reciente."
     )
-    st.dataframe(
-        df_expectations,
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(df_expectations, use_container_width=True, hide_index=True)
 
 with tab_milestones:
     filter_cat = st.selectbox(
@@ -720,16 +898,10 @@ with tab_milestones:
         hide_index=True,
         column_config={
             "Probabilidad (%)": st.column_config.ProgressColumn(
-                "Probabilidad (%)",
-                min_value=0,
-                max_value=100,
-                format="%.1f%%",
+                "Probabilidad (%)", min_value=0, max_value=100, format="%.1f%%"
             ),
             "Hit Rate L10 (%)": st.column_config.ProgressColumn(
-                "Hit Rate L10 (%)",
-                min_value=0,
-                max_value=100,
-                format="%.1f%%",
+                "Hit Rate L10 (%)", min_value=0, max_value=100, format="%.1f%%"
             ),
         },
     )
@@ -737,11 +909,96 @@ with tab_milestones:
 st.divider()
 
 # ---------------------------------------------------------
-# SIMULADOR CUANTITATIVO OVER / UNDER Y GRÁFICO DE TENDENCIA
+# NUEVA SECCIÓN: ESCÁNER DE CUOTAS Y DETECCIÓN DE ERRORES (EV+)
 # ---------------------------------------------------------
-st.markdown("### 🎯 Simulador Personalizado de Líneas (Over / Under) y Tendencia")
+st.markdown("### 💰 Escáner de Cuotas y Detección de Errores (Value Bets / EV+)")
+st.caption(
+    "Compara las cuotas ofrecidas por las casas de apuestas contra la probabilidad estadística del modelo. "
+    "Un **EV% positivo** y un **Edge% > 3%** indican una cuota mal calibrada a favor del apostador."
+)
 
-sim_col1, sim_col2 = st.columns([1.2, 2.3])
+if not active_odds_key:
+    st.info(
+        "🔑 **Modo sin API Key activa:** Puedes ingresar cuotas manualmente en el **Simulador de Líneas** de abajo "
+        "para calcular el **EV%** y el **Stake Kelly**, o pegar tu clave gratuita de **The Odds API** en la barra lateral "
+        "(`ODDS_API_KEY`) para escanear automáticamente DraftKings, FanDuel, BetMGM y otras casas."
+    )
+else:
+    col_opt1, col_opt2, col_opt3 = st.columns([1.5, 1.5, 2.0])
+    with col_opt1:
+        regions_sel = st.selectbox(
+            "Región de Casas de Apuestas",
+            ["us,eu", "us", "eu", "uk"],
+            index=0,
+            help="'us,eu' incluye casas americanas (DraftKings, FanDuel, BetMGM) y europeas.",
+        )
+    with col_opt2:
+        only_ev_plus = st.checkbox("Mostrar solo errores con valor (EV+ > 0%)", value=False)
+    with col_opt3:
+        st.write("")
+        scan_clicked = st.button("🔍 Escanear Cuotas de Hoy y Buscar Errores (EV+)", type="primary")
+
+    if scan_clicked:
+        with st.spinner("Consultando líneas y cuotas de Player Props en tiempo real..."):
+            events_list, status_msg = fetch_odds_api_events(active_odds_key)
+            if not events_list:
+                st.error(status_msg or "No se encontraron partidos activos en The Odds API.")
+            else:
+                team_nick = _normalize_text(selected_team_obj.get("nickname", "")) if selected_team_obj else ""
+                matched_event = None
+                for ev in events_list:
+                    h_norm = _normalize_text(ev.get("home_team", ""))
+                    a_norm = _normalize_text(ev.get("away_team", ""))
+                    if team_nick and (team_nick in h_norm or team_nick in a_norm):
+                        matched_event = ev
+                        break
+
+                if not matched_event:
+                    st.warning(
+                        f"El equipo **{selected_team_obj['name']}** no tiene un partido abierto con mercados "
+                        "de Player Props publicados en este momento (las casas suelen abrirlos horas antes del salto inicial)."
+                    )
+                else:
+                    event_data, quota_msg = fetch_event_player_props(
+                        active_odds_key, matched_event["id"], regions=regions_sel
+                    )
+                    st.caption(f"Partido detectado: **{matched_event['away_team']} @ {matched_event['home_team']}**  •  {quota_msg}")
+
+                    df_odds_scan = parse_and_scan_player_odds(
+                        event_data, player_obj["name"], df_filtered, weight_recent=recent_weight
+                    )
+
+                    if df_odds_scan.empty:
+                        st.warning(
+                            f"Aún no hay cuotas publicadas específicamente para **{player_obj['name']}** "
+                            "en este partido (puede estar marcado como cuestionable/lesionado o las líneas aún no abren)."
+                        )
+                    else:
+                        if only_ev_plus:
+                            df_odds_scan = df_odds_scan[df_odds_scan["EV (%)"] > 0.0].reset_index(drop=True)
+
+                        ev_count = int((df_odds_scan["EV (%)"] > 0.0).sum())
+                        if ev_count > 0:
+                            best_bet = df_odds_scan.iloc[0]
+                            st.success(
+                                f"🚨 **Se detectaron {ev_count} cuotas con Valor Esperado Positivo (EV+)** para {player_obj['name']}. "
+                                f"Mejor oportunidad: **{best_bet['Mercado']} — {best_bet['Selección']}** en **{best_bet['Casa']}** "
+                                f"a cuota **{best_bet['Cuota Casa']}** (Cuota justa: {best_bet['Cuota Justa']} | "
+                                f"**EV: +{best_bet['EV (%)']}%** | Edge: +{best_bet['Edge (%)']}%)."
+                            )
+                        else:
+                            st.info("No se detectaron cuotas con EV+ bajo los parámetros actuales.")
+
+                        st.dataframe(df_odds_scan, use_container_width=True, hide_index=True)
+
+st.divider()
+
+# ---------------------------------------------------------
+# SIMULADOR CUANTITATIVO OVER / UNDER + EVALUADOR MANUAL EV+
+# ---------------------------------------------------------
+st.markdown("### 🎯 Simulador Personalizado de Líneas (Over / Under) y Evaluador Manual de Cuotas")
+
+sim_col1, sim_col2 = st.columns([1.25, 2.25])
 
 available_metrics = ["PTS", "REB", "AST", "PRA", "PR", "PA", "RA", "3PM", "STOCKS", "STL", "BLK"]
 
@@ -760,8 +1017,7 @@ with sim_col1:
         df_filtered, selected_metric, target_line, weight_recent=recent_weight
     )
 
-    st.markdown(f"**Modelo aplicado:** `{sim_results['model_used']}`")
-    st.markdown(f"**Proyección ponderada:** `{sim_results['projected_mean']}` (Desv. Est: `{sim_results['std_all']}`)")
+    st.markdown(f"**Modelo aplicado:** `{sim_results['model_used']}`  •  **Proyección:** `{sim_results['projected_mean']}`")
 
     p_col1, p_col2 = st.columns(2)
     p_col1.metric(
@@ -774,6 +1030,31 @@ with sim_col1:
         f"{sim_results['prob_under']}%",
         f"Cuota justa: {sim_results['fair_odds_under']}",
     )
+
+    # Ingreso manual de cuotas de cualquier casa para calcular EV+
+    st.markdown("**Comprobar cuota de tu casa de apuestas:**")
+    odds_in1, odds_in2 = st.columns(2)
+    book_odds_over = odds_in1.number_input("Cuota OVER (Decimal)", min_value=1.01, max_value=50.0, value=1.87, step=0.02)
+    book_odds_under = odds_in2.number_input("Cuota UNDER (Decimal)", min_value=1.01, max_value=50.0, value=1.87, step=0.02)
+
+    ev_over = evaluate_bet_value(sim_results["prob_over"], book_odds_over)
+    ev_under = evaluate_bet_value(sim_results["prob_under"], book_odds_under)
+    vig_pct = round(((1 / book_odds_over) + (1 / book_odds_under) - 1) * 100, 2)
+
+    if ev_over["is_value"]:
+        st.success(
+            f"✅ **VALOR EN OVER {target_line}:** EV **+{ev_over['ev_pct']}%** | "
+            f"Edge **+{ev_over['edge_pct']}%** | Stake Kelly 1/4: **{ev_over['kelly_quarter_pct']}%**"
+        )
+    elif ev_under["is_value"]:
+        st.success(
+            f"✅ **VALOR EN UNDER {target_line}:** EV **+{ev_under['ev_pct']}%** | "
+            f"Edge **+{ev_under['edge_pct']}%** | Stake Kelly 1/4: **{ev_under['kelly_quarter_pct']}%**"
+        )
+    else:
+        st.caption(
+            f"Sin valor matemático (EV Over: {ev_over['ev_pct']}% | EV Under: {ev_under['ev_pct']}% | Comisión/Vig de la casa: {vig_pct}%)."
+        )
 
     st.info(
         f"**Hit Rate Histórico (Superó {target_line}):**\n"
@@ -826,7 +1107,7 @@ with sim_col2:
         xaxis_title="Partido",
         yaxis_title=selected_metric,
         template="plotly_dark",
-        height=430,
+        height=470,
         margin=dict(l=20, r=20, t=50, b=20),
         showlegend=False,
     )
@@ -845,11 +1126,7 @@ display_cols = [
     "FGM", "FGA", "FG%", "STL", "BLK", "TOV"
 ]
 
-st.dataframe(
-    df_filtered[display_cols],
-    use_container_width=True,
-    hide_index=True,
-)
+st.dataframe(df_filtered[display_cols], use_container_width=True, hide_index=True)
 
 csv_bytes = df_filtered[display_cols].to_csv(index=False).encode("utf-8")
 st.download_button(
