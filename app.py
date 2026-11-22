@@ -5,7 +5,8 @@ import numpy as np
 import unicodedata
 import plotly.graph_objects as go
 from scipy.stats import norm, poisson
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------
 # CONFIGURACIÓN DE PÁGINA
@@ -23,6 +24,8 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     )
 }
+
+NBA_TZ = ZoneInfo("America/New_York")
 
 SEASON_OPTIONS = {
     "2026-27 (Actual)": 2027,
@@ -120,12 +123,20 @@ def fetch_nba_teams() -> list[dict]:
     return sorted(teams, key=lambda x: x["name"])
 
 
-@st.cache_data(ttl=1800)
-def fetch_today_scoreboard() -> list[dict]:
-    """Obtiene los partidos programados para la jornada actual."""
+@st.cache_data(ttl=300)
+def fetch_scoreboard_by_date(date_yyyymmdd: str) -> list[dict]:
+    """
+    Obtiene los partidos programados para una fecha específica (formato YYYYMMDD)
+    en horario oficial NBA (America/New_York).
+    """
     url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = requests.get(
+            url,
+            params={"dates": date_yyyymmdd, "limit": 50},
+            headers=HEADERS,
+            timeout=15,
+        )
         resp.raise_for_status()
         data = resp.json()
     except requests.RequestException:
@@ -133,21 +144,36 @@ def fetch_today_scoreboard() -> list[dict]:
 
     games = []
     for event in data.get("events", []):
-        comp = event.get("competitions", [{}])[0]
-        competitors = comp.get("competitors", [])
-        if len(competitors) == 2:
-            home = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0])
-            away = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1])
-            status = event.get("status", {}).get("type", {}).get("shortDetail", "")
-            games.append(
-                {
-                    "label": f"{away['team']['abbreviation']} @ {home['team']['abbreviation']} ({status})",
-                    "home_id": str(home["team"]["id"]),
-                    "home_name": home["team"]["displayName"],
-                    "away_id": str(away["team"]["id"]),
-                    "away_name": away["team"]["displayName"],
-                }
-            )
+        comps = event.get("competitions", [])
+        if not comps:
+            continue
+        competitors = comps[0].get("competitors", [])
+        if len(competitors) < 2:
+            continue
+
+        home = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0])
+        away = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1])
+
+        home_team = home.get("team", {})
+        away_team = away.get("team", {})
+
+        home_abbr = home_team.get("abbreviation") or home_team.get("shortDisplayName", "LOC")
+        away_abbr = away_team.get("abbreviation") or away_team.get("shortDisplayName", "VIS")
+        status = event.get("status", {}).get("type", {}).get("shortDetail", "Programado")
+
+        games.append(
+            {
+                "label": f"{away_abbr} @ {home_abbr}  •  {status}",
+                "home_id": str(home_team.get("id", "")),
+                "home_name": home_team.get("displayName", home_abbr),
+                "home_abbr": home_abbr,
+                "home_logo": home_team.get("logo", ""),
+                "away_id": str(away_team.get("id", "")),
+                "away_name": away_team.get("displayName", away_abbr),
+                "away_abbr": away_abbr,
+                "away_logo": away_team.get("logo", ""),
+            }
+        )
     return games
 
 
@@ -364,7 +390,7 @@ def parse_and_scan_player_odds(
                 if not desc_norm or (target_norm != desc_norm and target_norm not in desc_norm):
                     continue
 
-                side = outcome.get("name", "")  # "Over" o "Under"
+                side = outcome.get("name", "")
                 line = outcome.get("point")
                 price = outcome.get("price")
 
@@ -686,25 +712,55 @@ with st.sidebar:
     selected_team_obj = None
 
     if search_mode == "Partidos de Hoy (Cartelera)":
-        today_games = fetch_today_scoreboard()
-        if today_games:
-            game_labels = [g["label"] for g in today_games]
-            chosen_game_label = st.selectbox("Partido de hoy", game_labels)
-            game_obj = next(g for g in today_games if g["label"] == chosen_game_label)
+        now_nba = datetime.now(NBA_TZ)
+        date_options = {
+            f"Hoy ({now_nba.strftime('%Y-%m-%d')})": now_nba.strftime("%Y%m%d"),
+            f"Mañana ({(now_nba + timedelta(days=1)).strftime('%Y-%m-%d')})": (now_nba + timedelta(days=1)).strftime("%Y%m%d"),
+            f"Ayer ({(now_nba - timedelta(days=1)).strftime('%Y-%m-%d')})": (now_nba - timedelta(days=1)).strftime("%Y%m%d"),
+        }
+
+        col_d1, col_d2 = st.columns([3, 1])
+        with col_d1:
+            selected_date_label = st.selectbox("Jornada NBA", list(date_options.keys()), index=0)
+        with col_d2:
+            st.write("")
+            if st.button("🔄", help="Actualizar partidos desde ESPN"):
+                fetch_scoreboard_by_date.clear()
+
+        target_yyyymmdd = date_options[selected_date_label]
+        slate_games = fetch_scoreboard_by_date(target_yyyymmdd)
+
+        if slate_games:
+            game_labels = [g["label"] for g in slate_games]
+            chosen_game_label = st.selectbox("Partido", game_labels)
+            game_obj = next(g for g in slate_games if g["label"] == chosen_game_label)
 
             team_choice = st.radio(
                 "Equipo del partido",
                 [
-                    (game_obj["away_id"], game_obj["away_name"]),
-                    (game_obj["home_id"], game_obj["home_name"]),
+                    (game_obj["away_id"], f"{game_obj['away_name']} (Visitante)"),
+                    (game_obj["home_id"], f"{game_obj['home_name']} (Local)"),
                 ],
                 format_func=lambda x: x[1],
             )
             selected_team_id = team_choice[0]
             selected_team_obj = next((t for t in teams_list if t["id"] == selected_team_id), None)
+
+            if not selected_team_obj:
+                is_home = selected_team_id == game_obj["home_id"]
+                selected_team_obj = {
+                    "id": selected_team_id,
+                    "name": game_obj["home_name"] if is_home else game_obj["away_name"],
+                    "nickname": game_obj["home_abbr"] if is_home else game_obj["away_abbr"],
+                    "abbr": game_obj["home_abbr"] if is_home else game_obj["away_abbr"],
+                    "logo": game_obj["home_logo"] if is_home else game_obj["away_logo"],
+                }
         else:
-            st.info("No hay partidos disponibles en la cartelera de hoy. Cambiando a lista general.")
-            search_mode = "Todos los Equipos (30)"
+            st.warning(
+                f"No hay partidos programados en ESPN para **{selected_date_label}**. "
+                "Prueba seleccionando otra jornada arriba o cambia a **Todos los Equipos (30)**."
+            )
+            st.stop()
 
     if search_mode == "Todos los Equipos (30)":
         team_names = [t["name"] for t in teams_list]
@@ -909,7 +965,7 @@ with tab_milestones:
 st.divider()
 
 # ---------------------------------------------------------
-# NUEVA SECCIÓN: ESCÁNER DE CUOTAS Y DETECCIÓN DE ERRORES (EV+)
+# ESCÁNER DE CUOTAS Y DETECCIÓN DE ERRORES (EV+)
 # ---------------------------------------------------------
 st.markdown("### 💰 Escáner de Cuotas y Detección de Errores (Value Bets / EV+)")
 st.caption(
@@ -920,8 +976,8 @@ st.caption(
 if not active_odds_key:
     st.info(
         "🔑 **Modo sin API Key activa:** Puedes ingresar cuotas manualmente en el **Simulador de Líneas** de abajo "
-        "para calcular el **EV%** y el **Stake Kelly**, o pegar tu clave gratuita de **The Odds API** en la barra lateral "
-        "(`ODDS_API_KEY`) para escanear automáticamente DraftKings, FanDuel, BetMGM y otras casas."
+        "para calcular el **EV%** y el **Stake Kelly**, o configurar `ODDS_API_KEY` en los Secrets de Streamlit "
+        "para escanear automáticamente DraftKings, FanDuel, BetMGM y otras casas."
     )
 else:
     col_opt1, col_opt2, col_opt3 = st.columns([1.5, 1.5, 2.0])
@@ -1031,7 +1087,6 @@ with sim_col1:
         f"Cuota justa: {sim_results['fair_odds_under']}",
     )
 
-    # Ingreso manual de cuotas de cualquier casa para calcular EV+
     st.markdown("**Comprobar cuota de tu casa de apuestas:**")
     odds_in1, odds_in2 = st.columns(2)
     book_odds_over = odds_in1.number_input("Cuota OVER (Decimal)", min_value=1.01, max_value=50.0, value=1.87, step=0.02)
